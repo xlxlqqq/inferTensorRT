@@ -1,3 +1,7 @@
+// 20260119
+// 使用TensorRT推理YOLO模型，目前只做了静态尺寸1 * 3 * 640 * 640的推理(Batch = 1)
+// programmer: xlxlqqq
+
 #include <NvInfer.h>
 #include <cuda_runtime_api.h>
 
@@ -61,6 +65,9 @@ private:
     int channel_;
     int H_;
     int W_;
+
+    int inputIndex_ = -1;
+    int outputIndex_ = -1;
     
     std::string engine_file_;
     std::string image_file_;
@@ -77,83 +84,10 @@ private:
 
     std::vector<float> input_data_;
 
-
-public:
-    TensorRTInfer(const std::string& engine_file, const std::string& image_file, int batch_size = 1) :
-        engine_file_(engine_file), image_file_(image_file), batch_(batch_size) { };
-
-    ~TensorRTInfer() {
-        if (!buffers_.empty()) {
-            for (auto b : buffers_) if (b) cudaFree(b);
-        }
-        context_->destroy();
-        engine_->destroy();
-        runtime_->destroy();
-    }
-
-    // 获取输出维度
-    std::vector<int> getOutDims() {
-        Dims outDims = engine_->getBindingDimensions(1);
-        return std::vector<int> {outDims.d[0], outDims.d[1], outDims.d[2]};
-    }
-
-    // 获取输入维度
-    std::vector<int> getInputDims() {
-        Dims inputDims = engine_->getBindingDimensions(0);
-        return std::vector<int> {inputDims.d[0], inputDims.d[1], inputDims.d[2], inputDims.d[3]};
-    }
-
-    /// <summary>
-    /// infer 初始化
-    /// </summary>
-    void initInfer() {
-        engine_data_ = readEngineFile(engine_file_);
-        runtime_ = createInferRuntime(gLogger_);
-        engine_ = runtime_->deserializeCudaEngine(engine_data_.data(), engine_data_.size());
-        context_ = engine_->createExecutionContext();
-
-        auto inputDims = engine_->getBindingDimensions(0);
-        std::cout << "input Dims" << std::endl;
-        std::cout << inputDims.d[0] << " " << inputDims.d[1] << " " << inputDims.d[2] << " " << inputDims.d[3] << std::endl;
-        batch_ = inputDims.d[0];
-        channel_ = inputDims.d[1];
-        H_ = inputDims.d[2];
-        W_ = inputDims.d[3];
-
-        // 申请显存
-        int nbBindings = engine_->getNbBindings();
-        buffers_ = std::vector<void*>(nbBindings);
-        sizes_ = std::vector<int>(nbBindings);
-
-        for (int i = 0; i < nbBindings; i++) {
-            Dims dims = engine_->getBindingDimensions(i);
-            sizes_[i] = volume(dims);
-            cudaMalloc(&buffers_[i], sizes_[i] * sizeof(float));
-        }
-        cudaStreamCreate(&stream_);
-
-    }
-
-    /// <summary>
-    /// 外部推理接口
-    /// </summary>
-    /// <returns></returns>
-    std::vector<float> infer() {
-        prepareData();
-        bool status = context_->enqueueV2(buffers_.data(), stream_, nullptr);
-        if (!status) {
-            std::cout << "infer failed!!!" << std::endl;
-            return std::vector<float>();
-        }
-        Dims out_dims = engine_->getBindingDimensions(1);
-        std::vector<float> output(volume(out_dims));
-        cudaMemcpyAsync(output.data(), buffers_[1], output.size() * sizeof(float),
-            cudaMemcpyDeviceToHost, stream_);
-        cudaStreamSynchronize(stream_);
-        std::cout << "output size: " << output.size() << std::endl;
-        std::cout << "output dims" << out_dims.d[0] << " " << out_dims.d[1] << " " << out_dims.d[2] << std::endl;
-        return output;
-    }
+    // 统计推理时间，由于GPU属于异步推理，需要用 cudaEvent 记录时间
+    cudaEvent_t h2d_start_, h2d_end_;
+    cudaEvent_t infer_start_, infer_end_;
+    cudaEvent_t d2h_start_, d2h_end_;
 
     /// <summary>
     /// 准备数据，包括图像预处理、数据拷贝等
@@ -176,8 +110,154 @@ public:
                 }
             }
         }
-        cudaMemcpyAsync(buffers_[0], input_data_.data(), input_data_.size() * sizeof(float),
+        // 拷贝CPU里面的输入张量到GPU
+        cudaMemcpyAsync(buffers_[inputIndex_], input_data_.data(), input_data_.size() * sizeof(float),
             cudaMemcpyHostToDevice, stream_);
+    }
+
+
+public:
+    TensorRTInfer(const std::string& engine_file, const std::string& image_file, int batch_size = 1) :
+        engine_file_(engine_file), image_file_(image_file), batch_(batch_size) { };
+
+    ~TensorRTInfer() {
+        cudaEventDestroy(h2d_start_);
+        cudaEventDestroy(h2d_end_);
+        cudaEventDestroy(infer_start_);
+        cudaEventDestroy(infer_end_);
+        cudaEventDestroy(d2h_start_);
+        cudaEventDestroy(d2h_end_);
+
+        if (!buffers_.empty()) {
+            for (auto b : buffers_) if (b) cudaFree(b);
+        }
+        if (context_) context_->destroy();
+        if (engine_) engine_->destroy();
+        if (runtime_) runtime_->destroy();
+    }
+
+    void SetImageFile(std::string image_file) {
+        image_file_ = image_file;
+    }
+
+    std::string GetImageFile() {
+        return image_file_;
+    }
+
+    void SetEngineFile(std::string engine_file) {
+        engine_file_ = engine_file;
+    }
+
+    std::string GetEngineFile() {
+        return engine_file_;
+    }
+
+    // 获取输出维度
+    std::vector<int> getOutDims() {
+        Dims outDims = engine_->getBindingDimensions(outputIndex_);
+        return std::vector<int> {outDims.d[0], outDims.d[1], outDims.d[2]};
+    }
+
+    // 获取输入维度
+    std::vector<int> getInputDims() {
+        Dims inputDims = engine_->getBindingDimensions(inputIndex_);
+        return std::vector<int> {inputDims.d[0], inputDims.d[1], inputDims.d[2], inputDims.d[3]};
+    }
+
+    /// <summary>
+    /// infer 初始化
+    /// </summary>
+    void initInfer() {
+        engine_data_ = readEngineFile(engine_file_);
+        runtime_ = createInferRuntime(gLogger_);
+        engine_ = runtime_->deserializeCudaEngine(engine_data_.data(), engine_data_.size());
+        context_ = engine_->createExecutionContext();
+
+        if (!runtime_ || !engine_ || !context_) {
+            throw std::runtime_error("TensorRT init failed");
+        }
+
+        // 查找 input / output binding index哪个绑定的是输入，哪个绑定的是输出
+        for (int i = 0; i < engine_->getNbBindings(); ++i) {
+            if (engine_->bindingIsInput(i)) {
+                inputIndex_ = i;
+            }
+            else {
+                outputIndex_ = i;
+            }
+        }
+
+        if (inputIndex_ == -1 || outputIndex_ == -1) {
+            throw std::runtime_error("Failed to find input or output binding index");
+        }
+
+        auto inputDims = engine_->getBindingDimensions(0);
+        std::cout << "input Dims" << std::endl;
+        std::cout << inputDims.d[0] << " " << inputDims.d[1] << " " << inputDims.d[2] << " " << inputDims.d[3] << std::endl;
+        batch_ = inputDims.d[0];
+        channel_ = inputDims.d[1];
+        H_ = inputDims.d[2];
+        W_ = inputDims.d[3];
+
+        // 申请显存
+        int nbBindings = engine_->getNbBindings();
+        buffers_ = std::vector<void*>(nbBindings);
+        sizes_ = std::vector<int>(nbBindings);
+
+        for (int i = 0; i < nbBindings; i++) {
+            Dims dims = engine_->getBindingDimensions(i);
+            sizes_[i] = volume(dims);
+            cudaMalloc(&buffers_[i], sizes_[i] * sizeof(float));
+        }
+        cudaStreamCreate(&stream_);
+
+        cudaEventCreate(&h2d_start_);
+        cudaEventCreate(&h2d_end_);
+        cudaEventCreate(&infer_start_);
+        cudaEventCreate(&infer_end_);
+        cudaEventCreate(&d2h_start_);
+        cudaEventCreate(&d2h_end_);
+    }
+
+    /// <summary>
+    /// 外部推理接口
+    /// </summary>
+    /// <returns></returns>
+    std::vector<float> infer() {
+        cudaEventRecord(h2d_start_, stream_);
+        prepareData();   // 内部有 cudaMemcpyAsync
+        cudaEventRecord(h2d_end_, stream_);
+
+        cudaEventRecord(infer_start_, stream_);
+        bool status = context_->enqueueV2(buffers_.data(), stream_, nullptr);
+        cudaEventRecord(infer_end_, stream_);
+        if (!status) {
+            std::cout << "infer failed!!!" << std::endl;
+            return std::vector<float>();
+        }
+        Dims out_dims = engine_->getBindingDimensions(1);
+        std::vector<float> output(volume(out_dims));
+
+        cudaEventRecord(d2h_start_, stream_);
+        // 拷贝GPU里的推理结果到CPU
+        cudaMemcpyAsync(output.data(), buffers_[outputIndex_],
+            output.size() * sizeof(float),
+            cudaMemcpyDeviceToHost, stream_);
+        cudaEventRecord(d2h_end_, stream_);
+
+        cudaStreamSynchronize(stream_);
+        
+        float h2d_ms = 0.f, infer_ms = 0.f, d2h_ms = 0.f;
+        cudaEventElapsedTime(&h2d_ms, h2d_start_, h2d_end_);
+        cudaEventElapsedTime(&infer_ms, infer_start_, infer_end_);
+        cudaEventElapsedTime(&d2h_ms, d2h_start_, d2h_end_);
+
+        std::cout << "H2D time   : " << h2d_ms << " ms" << std::endl;
+        std::cout << "Infer time : " << infer_ms << " ms" << std::endl;
+        std::cout << "D2H time   : " << d2h_ms << " ms" << std::endl;
+        std::cout << "Total GPU  : " << (h2d_ms + infer_ms + d2h_ms) << " ms" << std::endl;
+
+        return output;
     }
 
 };
@@ -291,10 +371,7 @@ int main() {
     
     TensorRTInfer infer(engine_file, image_file);
     infer.initInfer();
-    auto start = std::chrono::high_resolution_clock::now();
     std::vector<float> output = infer.infer();
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
     auto detections = decode(output, infer.getOutDims(), 0.25f);
 
